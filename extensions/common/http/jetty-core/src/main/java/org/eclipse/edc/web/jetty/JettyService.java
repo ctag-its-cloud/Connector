@@ -87,6 +87,18 @@ public class JettyService implements WebServer {
                     .map(PortMapping::toString)
                     .collect(joining(", "));
 
+            // The default "/" handler (created in the constructor for websocket support)
+            // has no virtual host restriction and would match ALL requests before any
+            // port-specific handler gets a chance. Remove it from the collection if it
+            // has no servlets registered (i.e., no websocket endpoints were added).
+            // This allows port-specific handlers (public, control, etc.) to receive
+            // requests correctly via virtual host matching.
+            var defaultHandler = handlers.get("/");
+            if (defaultHandler != null && defaultHandler.getServletHandler().getServlets() == null) {
+                handlers.remove("/");
+                monitor.debug("JettyService: removed empty default '/' handler from ContextHandlerCollection");
+            }
+
             server.setHandler(new ContextHandlerCollection(handlers.values().toArray(ServletContextHandler[]::new)));
             server.start();
             monitor.debug("Port mappings: " + portMappingsDescription);
@@ -119,11 +131,29 @@ public class JettyService implements WebServer {
                 .orElseThrow(() -> new IllegalArgumentException("No PortMapping for contextName '" + contextName + "' found"))
                 .path();
 
-        var servletHandler = getOrCreate(actualPath).getServletHandler();
+        var handler = getOrCreate(actualPath);
+        var servletHandler = handler.getServletHandler();
         servletHandler.addServletWithMapping(servletHolder, actualPath);
 
         var allPathSpec = actualPath.endsWith("/") ? "*" : "/*";
         servletHandler.addServletWithMapping(servletHolder, actualPath + allPathSpec);
+
+        // If Jetty is already running, the servlet holder must be started explicitly.
+        // Without this, dynamic servlet registration after server.start() has no effect
+        // and all requests to the context return 404.
+        if (server != null && server.isRunning()) {
+            try {
+                monitor.info("JettyService: starting servlet holder for context '" + contextName + "' path='" + actualPath + "' serverRunning=" + server.isRunning());
+                servletHolder.start();
+                servletHolder.initialize();
+                monitor.info("JettyService: servlet holder started successfully for context '" + contextName + "'");
+            } catch (Exception e) {
+                monitor.severe("JettyService: failed to start servlet holder for context '" + contextName + "': " + e.getMessage());
+                throw new EdcException("Failed to start servlet holder for context '" + contextName + "'", e);
+            }
+        } else {
+            monitor.info("JettyService: server not running yet, servlet for context '" + contextName + "' will be started with Jetty");
+        }
     }
 
     public void addConnectorConfigurationCallback(Consumer<ServerConnector> callback) {
